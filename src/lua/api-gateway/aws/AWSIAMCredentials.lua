@@ -15,6 +15,7 @@ local cacheCls = require "api-gateway.cache.cache"
 local DEFAULT_SECURITY_CREDENTIALS_HOST = "169.254.169.254"
 local DEFAULT_SECURITY_CREDENTIALS_PORT = "80"
 local DEFAULT_SECURITY_CREDENTIALS_URL = "/latest/meta-data/iam/security-credentials/"
+local DEFAULT_SECURITY_API_TOKEN_URL = "/latest/api/token"
 -- use GET /latest/meta-data/iam/security-credentials/ to auto-discover the IAM Role
 local DEFAULT_TOKEN_EXPIRATION = 60*60*24 -- in seconds
 
@@ -76,6 +77,7 @@ function AWSIAMCredentials:new(o)
         self.security_credentials_port = o.security_credentials_port or DEFAULT_SECURITY_CREDENTIALS_PORT
         self.security_credentials_url = o.security_credentials_url or DEFAULT_SECURITY_CREDENTIALS_URL
         self.shared_cache_dict = o.shared_cache_dict
+	    self.security_api_token_url = o.security_api_token_url or DEFAULT_SECURITY_API_TOKEN_URL
         if (o.shared_cache_dict ~= nil) then
             initIamCache(o.shared_cache_dict)
         end
@@ -94,13 +96,46 @@ function AWSIAMCredentials:loadCredentialsFromSharedDict()
         cache.Token = iamCreds.Token
         cache.ExpireAt = iamCreds.ExpireAt
         cache.ExpireAtTimestamp = iamCreds.ExpireAtTimestamp
+	    cache.MetadataToken = iamCreds.MetadataToken
         ngx.log(ngx.DEBUG, "Cache has been loaded from Shared Cache" )
     end
+end
+
+function AWSIAMCredentials:fetchToken()
+     ngx.log(ngx.DEBUG, "Fetching TOKEN from /api/token",
+        self.security_credentials_host, ":", self.security_credentials_port, self.security_api_token_url)
+     local hc2 = http:new()
+     local request_headers = {
+             ["X-aws-ec2-metadata-token-ttl-seconds"] = 21600
+     }
+     local ok, code, headers, status, body = hc2:request{
+        host = self.security_credentials_host,
+        port = self.security_credentials_port,
+        url = self.security_api_token_url,
+        method = "PUT",
+        headers = request_headers,
+        keepalive = false 
+    }
+    if (code == ngx.HTTP_OK and body ~= nil) then
+        ngx.log(ngx.DEBUG, "found token:" .. tostring(body))
+        return body
+    end
+    ngx.log(ngx.WARN, "Could not fetch token from:", self.security_credentials_host, ":", self.security_credentials_port, self.security_api_token_url, ":", code, ":", status)
+    return nil
 end
 
 ---
 -- Auto discover the IAM User
 function AWSIAMCredentials:fetchIamUser()
+    ngx.log(ngx.DEBUG, "Invoking fetchToken method")
+    local token = self:fetchToken()
+    if token == nil then
+        ngx.log(ngx.WARN, "Failed to get token")
+        return nil
+    end
+    local request_header = {
+	    ["X-aws-ec2-metadata-token"] = token
+    }
     ngx.log(ngx.DEBUG, "Fetching IAM User from:",
         self.security_credentials_host, ":", self.security_credentials_port, self.security_credentials_url)
     local hc1 = http:new()
@@ -110,8 +145,8 @@ function AWSIAMCredentials:fetchIamUser()
         port = self.security_credentials_port,
         url = self.security_credentials_url,
         method = "GET",
-        keepalive = 30000, -- 30s keepalive
-        poolsize = 50
+        keepalive = false,
+	    headers = request_header
     }
 
     if (code == ngx.HTTP_OK and body ~= nil) then
@@ -119,7 +154,7 @@ function AWSIAMCredentials:fetchIamUser()
         ngx.log(ngx.DEBUG, "found user:" .. tostring(body))
         return cache.IamUser
     end
-    ngx.log(ngx.WARN, "Could not fetch iam user from:", self.security_credentials_host, ":", self.security_credentials_port, self.security_credentials_url)
+    ngx.log(ngx.WARN, "Could not fetch iam user from:", self.security_credentials_host, ":", self.security_credentials_port, self.security_credentials_url, ": code =", code , ":status=", status)
     return nil
 end
 
@@ -136,19 +171,24 @@ end
 -- Get credentials for the IAM User
 function AWSIAMCredentials:fetchSecurityCredentialsFromAWS()
     local iamURL = self.security_credentials_url .. self:getIamUser() .. "?DurationSeconds=" .. self.security_credentials_timeout
-
-    local hc1 = http:new()
-
-    local ok, code, headers, status, body = hc1:request{
+    local token = self:fetchToken()
+    if token == nil then
+            ngx.log(ngx.WARN, "Failed to get token")
+            return nil
+    end
+    local request_header = {
+            ["X-aws-ec2-metadata-token"] = token
+    }
+    local hc2 = http:new()
+    local ok, code, headers, status, body = hc2:request{
         host = self.security_credentials_host,
         port = self.security_credentials_port,
         url = iamURL,
         method = "GET",
-        keepalive = 30000, -- 30s keepalive
-        poolsize = 50
+	    headers = request_header
     }
 
-    ngx.log(ngx.DEBUG, "AWS Response:" .. tostring(body))
+    ngx.log(ngx.DEBUG, "AWS Response:" .. tostring(body), code, tableToString(headers), status, ok)
 
     local aws_response = cjson.decode(body)
 
