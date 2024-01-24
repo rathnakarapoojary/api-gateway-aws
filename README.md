@@ -1,4 +1,4 @@
-api-gateway-aws
+api-gateway-awsss
 ===============
 
 Lua module for AWS APIs . The missing AWS SDK from Nginx/Openresty.
